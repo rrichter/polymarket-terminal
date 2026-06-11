@@ -7,7 +7,7 @@
  *   Min 5 shares per tier, total = SNIPER_MAX_SHARES × timeMultiplier
  */
 
-import { Side, OrderType } from '@polymarket/clob-client';
+import { Side, OrderType } from '@polymarket/clob-client-v2';
 import config from '../config/index.js';
 import { getClient } from './client.js';
 import logger from '../utils/logger.js';

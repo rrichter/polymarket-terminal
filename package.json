@@ -26,7 +26,7 @@
     "maker-mm-sim": "DRY_RUN=true node src/maker-mm.js",
     "maker-mm-bot": "node src/maker-mm-bot.js",
     "maker-mm-bot-sim": "DRY_RUN=true node src/maker-mm-bot.js",
-    "postinstall": "node scripts/patch-clob-client.cjs"
+    "postinstall": "node scripts/patch-clob-client-v2.cjs"
   },
   "keywords": [
     "polymarket",
@@ -36,8 +36,9 @@
   "author": "direkturcrypto",
   "license": "ISC",
   "dependencies": {
-    "@polymarket/clob-client": "^4.7.3",
+    "@polymarket/clob-client-v2": "^1.0.6",
     "blessed": "^0.1.81",
+    "viem": "^2.27.0",
     "dotenv": "^16.4.7",
     "ethers": "^5.8.0",
     "global-agent": "^4.1.2",

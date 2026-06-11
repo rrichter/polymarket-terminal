@@ -1,12 +1,17 @@
-import { ClobClient } from '@polymarket/clob-client';
+import { ClobClient, Chain, SignatureTypeV2, AssetType } from '@polymarket/clob-client-v2';
+import { createWalletClient, http } from 'viem';
+import { polygon } from 'viem/chains';
+import { privateKeyToAccount } from 'viem/accounts';
 import { ethers, Wallet } from 'ethers';
 import config from '../config/index.js';
 import logger from '../utils/logger.js';
 import { setupAxiosProxy, testProxy } from '../utils/proxy.js';
 
 let clobClient = null;
-let signer = null;
-let _provider = null; // singleton — reused across all onchain calls
+let _walletClient = null;   // viem WalletClient (for CLOB signing)
+let signer = null;          // ethers Wallet (for on-chain Safe transactions)
+let _provider = null;       // singleton — reused across all onchain calls
+let _apiCreds = null;       // API credentials (stored for user WS auth)
 
 /**
  * Initialize the Polymarket CLOB client
@@ -23,13 +28,23 @@ export async function initClient() {
         process.exit(1);
     }
 
-    logger.info('Initializing Polymarket CLOB client...');
+    logger.info('Initializing Polymarket CLOB client (v2)...');
 
+    // ── Create viem wallet client (for CLOB signing only — no RPC calls) ──
+    const account = privateKeyToAccount(config.privateKey);
+    _walletClient = createWalletClient({
+        account,
+        chain: polygon,
+        transport: http(config.polygonRpcUrl),
+    });
+
+    // ── Create ethers Wallet (kept for on-chain Safe/CTF operations) ──
     signer = new Wallet(config.privateKey);
-    logger.info(`EOA (signer)  : ${signer.address}`);
+
+    logger.info(`EOA (signer)  : ${account.address}`);
     logger.info(`Proxy wallet  : ${config.proxyWallet}`);
 
-    // Step 1: Create temp client to derive API credentials
+    // Step 1: Create temp client to derive API credentials (L1 auth)
     let apiCreds;
     if (config.clobApiKey && config.clobApiSecret && config.clobApiPassphrase) {
         apiCreds = {
@@ -39,28 +54,38 @@ export async function initClient() {
         };
         logger.info('Using API credentials from .env');
     } else {
-        const tempClient = new ClobClient(config.clobHost, config.chainId, signer);
+        const tempClient = new ClobClient({
+            host: config.clobHost,
+            chain: Chain.POLYGON,
+            signer: _walletClient,
+        });
         apiCreds = await tempClient.createOrDeriveApiKey();
         logger.info('API credentials derived successfully');
     }
 
-    // Step 2: Initialize full trading client
-    // proxyWallet = funder address (where USDC.e is held)
-    clobClient = new ClobClient(
-        config.clobHost,
-        config.chainId,
-        signer,
-        apiCreds,
-        2, // Signature type: 2 = POLY_PROXY (EOA signs on behalf of proxy wallet)
-        config.proxyWallet, // Funder = proxy wallet (deposit USDC.e here)
-    );
+    // Store for user WebSocket auth (needed by userWsWatcher)
+    _apiCreds = apiCreds;
 
-    logger.success('CLOB client initialized');
+    // Step 2: Initialize full trading client (L1 + L2 auth)
+    // signatureType: POLY_1271 = EIP-1271 smart contract signatures (Gnosis Safe)
+    // funderAddress = proxy wallet where USDC.e is held
+    clobClient = new ClobClient({
+        host: config.clobHost,
+        chain: Chain.POLYGON,
+        signer: _walletClient,
+        creds: apiCreds,
+        signatureType: SignatureTypeV2.POLY_1271,
+        funderAddress: config.proxyWallet,
+        useServerTime: true,
+        throwOnError: true,
+    });
+
+    logger.success('CLOB client initialized (v2)');
     return clobClient;
 }
 
 /**
- * Get the initialized CLOB client
+ * Get the initialized CLOB client (v2)
  */
 export function getClient() {
     if (!clobClient) {
@@ -70,7 +95,27 @@ export function getClient() {
 }
 
 /**
- * Get the signer wallet
+ * Get the viem WalletClient (for CLOB signing)
+ */
+export function getWalletClient() {
+    if (!_walletClient) {
+        throw new Error('Wallet client not initialized. Call initClient() first.');
+    }
+    return _walletClient;
+}
+
+/**
+ * Get API credentials (for user WebSocket auth)
+ */
+export function getApiCredentials() {
+    if (!_apiCreds) {
+        throw new Error('CLOB client not initialized. Call initClient() first.');
+    }
+    return _apiCreds;
+}
+
+/**
+ * Get the ethers Wallet signer (for on-chain Safe transactions)
  */
 export function getSigner() {
     if (!signer) {
@@ -101,4 +146,16 @@ export async function getUsdcBalance() {
     const usdc = new ethers.Contract(usdcAddress, abi, provider);
     const balance = await usdc.balanceOf(config.proxyWallet);
     return parseFloat(ethers.utils.formatUnits(balance, 6));
+}
+
+/**
+ * Get USDC balance from the CLOB REST API (L2 auth).
+ * Queries Polymarket's /balance-allowance endpoint — returns your actual
+ * account balance including funds held in the CLOB exchange.
+ */
+export async function getClobBalance() {
+    const client = getClient();
+    const result = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    // CLOB returns raw 6-decimal units (e.g. 84646550 = $84.65 USDC)
+    return parseFloat(result?.balance ?? '0') / 1_000_000;
 }

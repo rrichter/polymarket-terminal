@@ -1,7 +1,7 @@
-import { Side, OrderType } from '@polymarket/clob-client';
+import { Side, OrderType } from '@polymarket/clob-client-v2';
 import { ethers } from 'ethers';
 import config from '../config/index.js';
-import { getClient, getUsdcBalance, getPolygonProvider } from './client.js';
+import { getClient, getClobBalance, getPolygonProvider } from './client.js';
 import { hasPosition, addPosition, getPosition, updatePosition, removePosition } from './position.js';
 import { fetchMarketByTokenId } from './watcher.js';
 import { placeAutoSell } from './autoSell.js';
@@ -45,7 +45,7 @@ async function calculateTradeSize() {
     if (config.sizeMode === 'percentage') {
         return config.maxPositionSize * (config.sizePercent / 100);
     } else if (config.sizeMode === 'balance') {
-        const balance = await getUsdcBalance();
+        const balance = await getClobBalance();
         return balance * (config.sizePercent / 100);
     }
     return 0;
@@ -188,7 +188,15 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
         return;
     }
     if (marketOpts.endDateIso) {
-        const secsLeft = (new Date(marketOpts.endDateIso).getTime() - Date.now()) / 1000;
+        // Gamma API returns endDate as Unix timestamp (seconds), not ISO string.
+        // new Date("1749696000") interprets as ms → date in 1970.
+        let endMs;
+        if (/^\d{10}$/.test(String(marketOpts.endDateIso))) {
+            endMs = Number(marketOpts.endDateIso) * 1000;  // seconds → ms
+        } else {
+            endMs = new Date(marketOpts.endDateIso).getTime();
+        }
+        const secsLeft = (endMs - Date.now()) / 1000;
         if (secsLeft < config.minMarketTimeLeft) {
             const minsLeft = Math.max(0, Math.floor(secsLeft / 60));
             const sLeft    = Math.max(0, Math.floor(secsLeft % 60));
@@ -232,7 +240,7 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
     }
 
     // Check balance
-    const balance = await getUsdcBalance();
+    const balance = await getClobBalance();
     if (balance < tradeSize) {
         logger.error(`Insufficient balance: $${balance.toFixed(2)} < $${tradeSize.toFixed(2)} needed`);
         return;
@@ -288,13 +296,13 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
                     tokenID: tokenId,
                     side: Side.BUY,
                     amount: remainingAmount,
-                    price: Math.min(price * 1.02, 0.99), // 2% slippage, max 0.99
+                    orderType: OrderType.FAK,
                 },
                 {
                     tickSize: marketOpts.tickSize,
                     negRisk: marketOpts.negRisk,
                 },
-                OrderType.FAK, // Fill-and-Kill: takes what's available, no full-fill requirement
+                OrderType.FAK,
             );
 
             if (response && response.success) {
@@ -481,14 +489,14 @@ export async function executeSell(trade) {
                     {
                         tokenID: tokenId,
                         side: Side.SELL,
-                        amount: sharesToSell,
-                        price: Math.max(price * 0.98, 0.01), // 2% slippage, min 0.01
+                        amount: sharesToSell * price, // V2: amount is USDC, not shares
+                        orderType: OrderType.FAK,
                     },
                     {
                         tickSize: marketOpts.tickSize,
                         negRisk: marketOpts.negRisk,
                     },
-                    OrderType.FAK, // Fill-and-Kill: takes what's available
+                    OrderType.FAK,
                 );
 
                 if (response && response.success) {

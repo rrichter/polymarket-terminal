@@ -22,8 +22,8 @@ import logger from '../utils/logger.js';
 
 const RTDS_WS_URL = 'wss://ws-live-data.polymarket.com';
 const PING_INTERVAL_MS = 5000;
-const INITIAL_RECONNECT_DELAY = 2000;
-const MAX_RECONNECT_DELAY = 30000;
+const INITIAL_RECONNECT_DELAY = 15000;
+const MAX_RECONNECT_DELAY = 120000;
 
 class MMFillWatcher extends EventEmitter {
     constructor() {
@@ -106,7 +106,12 @@ class MMFillWatcher extends EventEmitter {
 
         this._ws.on('error', (err) => {
             this._connected = false;
-            logger.error(`MM fill watcher: WS error: ${err.message}`);
+            if (err.message.includes('429')) {
+                this._reconnectDelay = Math.max(this._reconnectDelay, 60000);
+                logger.warn(`MM fill watcher: rate-limited (429) — backing off ${this._reconnectDelay / 1000}s`);
+            } else {
+                logger.error(`MM fill watcher: WS error: ${err.message}`);
+            }
             this._cleanup(true);
         });
     }

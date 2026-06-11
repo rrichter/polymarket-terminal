@@ -8,10 +8,10 @@
  *   5. Merge YES+NO → $1.00 USDC → profit + maker rebates
  */
 
-import { Side, OrderType } from '@polymarket/clob-client';
+import { Side, OrderType } from '@polymarket/clob-client-v2';
 import { ethers } from 'ethers';
 import config from '../config/index.js';
-import { getClient, getUsdcBalance, getPolygonProvider } from './client.js';
+import { getClient, getClobBalance, getPolygonProvider } from './client.js';
 import { mergePositions, redeemPositions } from './ctf.js';
 import { mmFillWatcher } from './mmWsFillWatcher.js';
 import logger from '../utils/logger.js';
@@ -157,7 +157,7 @@ async function marketSellToken(tokenId, shares, tickSize, negRisk, tag) {
 
         try {
             const response = await client.createAndPostMarketOrder(
-                { tokenID: tokenId, side: Side.SELL, amount: sharesToSell, price: refPrice },
+                { tokenID: tokenId, side: Side.SELL, amount: sharesToSell * refPrice, orderType: OrderType.FAK },
                 { tickSize, negRisk },
                 OrderType.FAK,
             );
@@ -783,7 +783,7 @@ export async function executeMakerRebateStrategy(market) {
     const totalCost = yesCost + noCost;
 
     if (!config.dryRun) {
-        const balance = await getUsdcBalance();
+        const balance = await getClobBalance();
         if (balance < totalCost) {
             logger.error(`MakerMM${tag}: insufficient balance $${balance.toFixed(2)} (need $${totalCost.toFixed(2)})`);
             return;

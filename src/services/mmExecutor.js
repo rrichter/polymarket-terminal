@@ -9,10 +9,10 @@
  *        - If ONE side already sold → cancel the other, market-sell remaining tokens
  */
 
-import { Side, OrderType } from '@polymarket/clob-client';
+import { Side, OrderType } from '@polymarket/clob-client-v2';
 import { ethers } from 'ethers';
 import config from '../config/index.js';
-import { getClient, getUsdcBalance, getPolygonProvider } from './client.js';
+import { getClient, getClobBalance, getPolygonProvider } from './client.js';
 import { splitPosition, mergePositions } from './ctf.js';
 import { mmFillWatcher } from './mmWsFillWatcher.js';
 import logger from '../utils/logger.js';
@@ -128,7 +128,7 @@ async function marketSell(tokenId, shares, tickSize, negRisk) {
     const client = getClient();
     try {
         const res = await client.createAndPostMarketOrder(
-            { tokenID: tokenId, side: Side.SELL, amount: shares, price: 0.01 },
+            { tokenID: tokenId, side: Side.SELL, amount: shares * 0.50, orderType: OrderType.FOK },
             { tickSize, negRisk },
             OrderType.FOK,
         );
@@ -954,7 +954,7 @@ async function attemptRecoveryBuy(pos) {
 
     // ── Balance check ─────────────────────────────────────────────
     if (!config.dryRun) {
-        const balance = await getUsdcBalance();
+        const balance = await getClobBalance();
         if (balance < recoverySize) {
             logger.warn(`MM recovery: insufficient balance $${balance.toFixed(2)} < $${recoverySize} needed`);
             return;
@@ -972,7 +972,7 @@ async function attemptRecoveryBuy(pos) {
     } else {
         try {
             const res = await client.createAndPostMarketOrder(
-                { tokenID: candidate.tokenId, side: Side.BUY, amount: recoverySize, price: 0.99 },
+                { tokenID: candidate.tokenId, side: Side.BUY, amount: recoverySize, orderType: OrderType.FOK },
                 { tickSize, negRisk },
                 OrderType.FOK,
             );
@@ -1024,7 +1024,7 @@ async function attemptRecoveryBuy(pos) {
 
     try {
         const sellRes = await client.createAndPostMarketOrder(
-            { tokenID: candidate.tokenId, side: Side.SELL, amount: filledShares, price: 0.01 },
+            { tokenID: candidate.tokenId, side: Side.SELL, amount: filledShares * currentPrice, orderType: OrderType.FOK },
             { tickSize, negRisk },
             OrderType.FOK,
         );
@@ -1063,7 +1063,7 @@ export async function executeMMStrategy(market) {
     // ── Balance check ───────────────────────────────────────────
     const totalNeeded = config.mmTradeSize * 2; // $10 total → 10 YES + 10 NO
     if (!config.dryRun) {
-        const balance = await getUsdcBalance();
+        const balance = await getClobBalance();
         if (balance < totalNeeded) {
             logger.error(`MM${tag}: insufficient balance $${balance.toFixed(2)} (need $${totalNeeded})`);
             return;

@@ -6,7 +6,7 @@
  *   pm2 logs polymarket-copy
  */
 import config, { validateConfig } from './config/index.js';
-import { initClient, getUsdcBalance, getClient } from './services/client.js';
+import { initClient, getClient, getClobBalance } from './services/client.js';
 import { executeBuy, executeSell } from './services/executor.js';
 import { checkAndRedeemPositions } from './services/redeemer.js';
 import { getOpenPositions } from './services/position.js';
@@ -29,7 +29,7 @@ async function handleTrade(trade) {
 // ── Periodic status log (replaces TUI right panel) ────────────────────────────
 async function printStatus() {
     try {
-        const balance   = await getUsdcBalance();
+        const balance   = await getClobBalance();
         const positions = getOpenPositions();
 
         logger.info(`--- Status | Balance: $${balance.toFixed(2)} USDC | Open positions: ${positions.length} ---`);
@@ -110,8 +110,9 @@ async function main() {
         process.exit(1);
     }
 
+    // Get balance from CLOB REST API (authenticated — always accurate)
     try {
-        const balance = await getUsdcBalance();
+        const balance = await getClobBalance();
         logger.money(`USDC.e Balance: $${balance.toFixed(2)}`);
     } catch (err) {
         logger.warn('Could not fetch balance:', err.message);
