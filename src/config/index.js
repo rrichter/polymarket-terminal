@@ -44,7 +44,7 @@ const config = {
 
   // Retry settings
   maxRetries: 5,
-  retryDelay: 3000,
+  retryDelay: parseInt(process.env.RETRY_DELAY || '500', 10),
 
   // Seconds to wait for a GTC limit order to fill when FAK finds no liquidity
   // (happens when copying trades into "next market" before sellers arrive)

@@ -8,6 +8,8 @@ const PING_INTERVAL_MS = 5000;
 const INITIAL_RECONNECT_DELAY = 2000;
 const MAX_RECONNECT_DELAY = 30000;
 const PROCESSED_FILE = 'processed_trades.json';
+const MAX_PROCESSED_IDS = 10_000;    // in-memory cap, pruned periodically
+const FLUSH_INTERVAL_MS = 30_000;    // flush to disk every 30s
 
 let ws = null;
 let pingTimer = null;
@@ -15,19 +17,71 @@ let reconnectTimer = null;
 let reconnectDelay = INITIAL_RECONNECT_DELAY;
 let tradeHandler = null;
 let isShuttingDown = false;
+let _flushTimer = null;
 
-function getProcessedIds() {
-    return readState(PROCESSED_FILE, { tradeIds: [] });
+// ── In-memory dedup Set — avoids synchronous disk I/O on every trade event ──
+// Initialized on connect(), loaded from processed_trades.json for crash recovery.
+const _processedIds = new Set();
+let _dirty = false; // true if there are unflushed additions
+
+/** Load processed IDs from disk (one-time at startup). */
+function _loadProcessedFromDisk() {
+    try {
+        const data = readState(PROCESSED_FILE, { tradeIds: [] });
+        if (Array.isArray(data.tradeIds)) {
+            for (const id of data.tradeIds) {
+                _processedIds.add(id);
+            }
+        }
+        logger.info(`Loaded ${_processedIds.size} processed trade IDs from disk`);
+    } catch (err) {
+        logger.warn(`Could not load processed trades: ${err.message}`);
+    }
 }
 
-function markProcessed(tradeId) {
-    const data = getProcessedIds();
-    if (data.tradeIds.includes(tradeId)) return false;
-    data.tradeIds.push(tradeId);
-    if (data.tradeIds.length > 500) {
-        data.tradeIds = data.tradeIds.slice(-500);
+/** Flush the in-memory Set to disk. Called periodically and on shutdown. */
+function _flushToDisk() {
+    if (!_dirty) return;
+    try {
+        // Keep only the most recent MAX_PROCESSED_IDS entries
+        const ids = Array.from(_processedIds);
+        if (ids.length > MAX_PROCESSED_IDS) {
+            const trimmed = ids.slice(-MAX_PROCESSED_IDS);
+            _processedIds.clear();
+            for (const id of trimmed) _processedIds.add(id);
+        }
+        writeState(PROCESSED_FILE, { tradeIds: Array.from(_processedIds) });
+        _dirty = false;
+    } catch (err) {
+        logger.warn(`Could not flush processed trades: ${err.message}`);
     }
-    writeState(PROCESSED_FILE, data);
+}
+
+/** Start periodic disk flush. */
+function _startFlushTimer() {
+    _stopFlushTimer();
+    _flushTimer = setInterval(_flushToDisk, FLUSH_INTERVAL_MS);
+}
+
+/** Stop periodic disk flush. */
+function _stopFlushTimer() {
+    if (_flushTimer) {
+        clearInterval(_flushTimer);
+        _flushTimer = null;
+    }
+}
+
+/** Check-and-insert a trade ID. Returns true if new (not previously seen). */
+function markProcessed(tradeId) {
+    if (_processedIds.has(tradeId)) return false;
+    _processedIds.add(tradeId);
+    _dirty = true;
+    // Prune in-memory if over 2x the cap (rare)
+    if (_processedIds.size > MAX_PROCESSED_IDS * 2) {
+        const ids = Array.from(_processedIds).slice(-MAX_PROCESSED_IDS);
+        _processedIds.clear();
+        for (const id of ids) _processedIds.add(id);
+    }
     return true;
 }
 
@@ -126,6 +180,8 @@ function stopPing() {
 
 function cleanup(reconnect = true) {
     stopPing();
+    _stopFlushTimer();
+    _flushToDisk(); // persist on disconnect
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -152,6 +208,12 @@ function scheduleReconnect() {
 
 function connect() {
     if (isShuttingDown) return;
+
+    // Load processed IDs from disk (crash recovery) on first connect
+    if (_processedIds.size === 0) {
+        _loadProcessedFromDisk();
+    }
+    _startFlushTimer();
 
     logger.info('Connecting to Polymarket RTDS WebSocket...');
     ws = new WebSocket(RTDS_WS_URL);

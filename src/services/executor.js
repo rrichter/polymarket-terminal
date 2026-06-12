@@ -7,14 +7,27 @@ import { fetchMarketByTokenId } from './watcher.js';
 import { placeAutoSell } from './autoSell.js';
 import { ensureExchangeApproval, CTF_ADDRESS } from './ctf.js';
 import { recordSimBuy } from '../utils/simStats.js';
+import { TTLCache } from '../utils/cache.js';
 import logger from '../utils/logger.js';
 
 const CTF_ABI_BALANCE = ['function balanceOf(address account, uint256 id) view returns (uint256)'];
 
-// Per-market buy queue: prevents concurrent buys for the same market.
-// Each conditionId maps to the Promise tail of its queue so calls are
-// chained — the next buy only starts after the previous one finishes.
-const _buyQueue = new Map();
+// ── TTL caches ───────────────────────────────────────────────────────────────
+// Market metadata (tickSize, negRisk, conditionId) is immutable per market lifetime.
+const _marketOptsCache = new TTLCache({ ttlMs: 300_000, maxSize: 200 });
+// CLOB balance changes with every fill; 2s TTL keeps it fresh enough for sizing.
+const _balanceCache = new TTLCache({ ttlMs: 2_000, maxSize: 1 });
+
+/** Cached wrapper around getClobBalance() — avoids redundant HTTP calls within a 2s window. */
+async function _getCachedBalance() {
+    return _balanceCache.get('clobBalance', () => getClobBalance());
+}
+
+// Per-market buy batching: when multiple BUY signals for the same market arrive
+// within BATCH_WINDOW_MS, they're merged into one combined order. This prevents
+// the second signal from waiting behind the first (which caused 19s delays).
+const BATCH_WINDOW_MS = 500;
+const _batchWindows = new Map(); // conditionId → { entries: [], timer: Timer, resolve: fn, promise: Promise }
 
 /**
  * Fetch the actual on-chain ERC-1155 balance for a conditional token.
@@ -45,144 +58,115 @@ async function calculateTradeSize() {
     if (config.sizeMode === 'percentage') {
         return config.maxPositionSize * (config.sizePercent / 100);
     } else if (config.sizeMode === 'balance') {
-        const balance = await getClobBalance();
+        const balance = await _getCachedBalance();
         return balance * (config.sizePercent / 100);
     }
     return 0;
 }
 
 /**
- * Get market options (tick size and neg risk) for a token
+ * Get market options (tick size and neg risk) for a token.
+ * Results are cached per tokenId with a 5-minute TTL — market metadata
+ * (tickSize, negRisk, conditionId) does not change during a market's lifetime.
  */
 async function getMarketOptions(tokenId) {
-    const client = getClient();
-    try {
-        // Try to get from market info
-        const marketInfo = await fetchMarketByTokenId(tokenId);
-        if (marketInfo) {
-            return {
-                tickSize:        String(marketInfo.orderPriceMinTickSize || '0.01'),
-                negRisk:         marketInfo.negRisk || false,
-                conditionId:     marketInfo.conditionId || '',
-                question:        marketInfo.question || '',
-                endDateIso:      marketInfo.endDate || null,
-                active:          marketInfo.active !== false,
-                acceptingOrders: marketInfo.acceptingOrders !== false,
-            };
+    return _marketOptsCache.get(tokenId, async () => {
+        const client = getClient();
+        try {
+            const marketInfo = await fetchMarketByTokenId(tokenId);
+            if (marketInfo) {
+                return {
+                    tickSize:        String(marketInfo.orderPriceMinTickSize || '0.01'),
+                    negRisk:         marketInfo.negRisk || false,
+                    conditionId:     marketInfo.conditionId || '',
+                    question:        marketInfo.question || '',
+                    endDateIso:      marketInfo.endDate || null,
+                    active:          marketInfo.active !== false,
+                    acceptingOrders: marketInfo.acceptingOrders !== false,
+                };
+            }
+        } catch (err) {
+            logger.warn('Failed to get market info, using defaults:', err.message);
         }
-    } catch (err) {
-        logger.warn('Failed to get market info, using defaults:', err.message);
+
+        // Fallback: try SDK methods
+        try {
+            const tickSize = await client.getTickSize(tokenId);
+            const negRisk = await client.getNegRisk(tokenId);
+            return { tickSize: String(tickSize), negRisk, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
+        } catch (err) {
+            logger.warn('Failed to get tick size from SDK, using default 0.01');
+            return { tickSize: '0.01', negRisk: false, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
+        }
+    });
+}
+
+/** Execute a merged batch of buys for the same market. */
+async function _executeBatchedBuys(effectiveConditionId, entries) {
+    if (entries.length === 0) return;
+
+    // Use marketOpts from the first entry (all same market)
+    const marketOpts = entries[0].marketOpts;
+    // Merge trades: sum the USDC sizes the trader deployed across all signals
+    const mergedTrade = {
+        ...entries[0].trade,
+        size: entries.reduce((sum, e) => sum + (e.trade.size || 0), 0),
+    };
+
+    if (entries.length > 1) {
+        logger.info(`Batching ${entries.length} concurrent BUY signals for ${mergedTrade.market || effectiveConditionId}`);
     }
 
-    // Fallback: try SDK methods
-    try {
-        const tickSize = await client.getTickSize(tokenId);
-        const negRisk = await client.getNegRisk(tokenId);
-        return { tickSize: String(tickSize), negRisk, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
-    } catch (err) {
-        logger.warn('Failed to get tick size from SDK, using default 0.01');
-        return { tickSize: '0.01', negRisk: false, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
-    }
+    await _doExecuteBuy(mergedTrade, marketOpts, effectiveConditionId);
 }
 
 /**
  * Execute a BUY trade (copy trader's buy).
- * Calls are serialized per market — concurrent events for the same market
- * are queued and processed one at a time to prevent duplicate positions.
+ * Uses a 500ms batching window — concurrent signals for the same market
+ * are merged into one combined order instead of serialized behind each other.
  */
 export function executeBuy(trade) {
     const { tokenId, conditionId } = trade;
 
-    // Resolve conditionId to use as queue key.
-    // getMarketOptions is a read-only fetch — safe to run outside the queue.
-    const queued = getMarketOptions(tokenId).then((marketOpts) => {
+    // Resolve conditionId to use as batch key.
+    return getMarketOptions(tokenId).then((marketOpts) => {
         const effectiveConditionId = conditionId || marketOpts.conditionId;
 
-        // Chain this buy after the previous one for the same market
-        const prev = _buyQueue.get(effectiveConditionId) ?? Promise.resolve();
-        const current = prev
-            .then(() => _doExecuteBuy(trade, marketOpts, effectiveConditionId))
-            .finally(() => {
-                // Remove from map only if we're still the tail (no newer call queued)
-                if (_buyQueue.get(effectiveConditionId) === current) {
-                    _buyQueue.delete(effectiveConditionId);
-                }
-            });
-        _buyQueue.set(effectiveConditionId, current);
-        return current;
-    });
-
-    return queued;
-}
-
-/**
- * GTC fallback for when FAK finds no liquidity (e.g. trader buys into "next market"
- * before any sellers exist). Places a GTC limit order and polls until filled or timeout.
- *
- * Returns { sharesFilled, costFilled } on success, or null on failure/timeout.
- */
-async function _tryGtcFallback(client, tokenId, tradeSize, price, marketOpts) {
-    const gtcPrice = parseFloat(Math.min(price * 1.02, 0.99).toFixed(4));
-    const shares   = parseFloat((tradeSize / gtcPrice).toFixed(4));
-
-    logger.info(`No liquidity via FAK — placing GTC limit buy: ${shares} shares @ $${gtcPrice}`);
-
-    let orderId;
-    try {
-        const resp = await client.createAndPostOrder(
-            { tokenID: tokenId, side: Side.BUY, price: gtcPrice, size: shares },
-            { tickSize: marketOpts.tickSize, negRisk: marketOpts.negRisk },
-            OrderType.GTC,
-        );
-        if (!resp?.success) {
-            logger.warn(`GTC fallback rejected: ${resp?.errorMsg || 'unknown'}`);
-            return null;
+        // If a batch window is already open for this market, merge into it
+        const existing = _batchWindows.get(effectiveConditionId);
+        if (existing) {
+            clearTimeout(existing.timer);
+            existing.entries.push({ trade, marketOpts });
+            // Reset the window — wait another BATCH_WINDOW_MS from latest signal
+            existing.timer = setTimeout(() => {
+                _batchWindows.delete(effectiveConditionId);
+                _executeBatchedBuys(effectiveConditionId, existing.entries).then(existing.resolve);
+            }, BATCH_WINDOW_MS);
+            return existing.promise;
         }
-        orderId = resp.orderID;
-        logger.info(`GTC order placed: ${orderId} — waiting for fill (up to ${config.gtcFallbackTimeout}s)...`);
-    } catch (err) {
-        logger.warn(`GTC fallback order failed: ${err.message}`);
-        return null;
-    }
 
-    const deadline    = Date.now() + config.gtcFallbackTimeout * 1000;
-    const pollMs      = 3000;
-
-    while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, pollMs));
-        try {
-            const order = await client.getOrder(orderId);
-            const matched = parseFloat(order?.size_matched ?? order?.matched_amount ?? '0');
-            const status  = (order?.status ?? order?.order_status ?? '').toLowerCase();
-
-            if (matched > 0 || status === 'matched' || status === 'filled') {
-                const sharesFilled = matched > 0 ? matched : shares;
-                const costFilled   = sharesFilled * gtcPrice;
-                logger.success(`GTC filled: ${sharesFilled.toFixed(4)} shares @ $${gtcPrice} | orderID: ${orderId}`);
-                return { sharesFilled, costFilled };
-            }
-
-            // Order gone from open orders also means it was matched
-            if (status === 'cancelled') {
-                logger.warn(`GTC order ${orderId} was cancelled externally`);
-                return null;
-            }
-        } catch { /* getOrder can 404 briefly — keep polling */ }
-    }
-
-    // Timed out — cancel the GTC
-    logger.warn(`GTC order ${orderId} not filled in ${config.gtcFallbackTimeout}s — cancelling`);
-    try { await client.cancelOrder({ orderID: orderId }); } catch { /* ignore */ }
-    return null;
+        // Start a new batch window
+        let resolveBatch;
+        const promise = new Promise((r) => { resolveBatch = r; });
+        const batch = {
+            entries: [{ trade, marketOpts }],
+            timer: setTimeout(() => {
+                _batchWindows.delete(effectiveConditionId);
+                _executeBatchedBuys(effectiveConditionId, batch.entries).then(resolveBatch);
+            }, BATCH_WINDOW_MS),
+            resolve: resolveBatch,
+            promise,
+        };
+        _batchWindows.set(effectiveConditionId, batch);
+        return promise;
+    });
 }
 
 /**
- * Internal: the actual buy logic, guaranteed to run serially per market.
+ * Internal: the actual buy logic. Now uses parallel FAK + GTC racing.
  */
 async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
     const { tokenId, conditionId, market, price, size } = trade;
-
-    // ── Market closed / not accepting orders guard ─────────────────────────────
     if (!marketOpts.active || !marketOpts.acceptingOrders) {
         logger.warn(`Market closed/not accepting orders: ${market || effectiveConditionId} — skipping buy`);
         return;
@@ -219,8 +203,8 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
         return;
     }
 
-    // Check balance
-    const balance = await getClobBalance();
+    // Check balance (cached within 2s window)
+    const balance = await _getCachedBalance();
     if (balance < tradeSize) {
         logger.error(`Insufficient balance: $${balance.toFixed(2)} < $${tradeSize.toFixed(2)} needed`);
         return;
@@ -255,52 +239,102 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
         return;
     }
 
-    // Place market order (FAK) with retries
+    // ── Parallel FAK + GTC execution ─────────────────────────────────────────
+    // Strategy: fire FAK and GTC concurrently. FAK fills instantly if liquidity
+    // exists; GTC catches fills when no sellers are present yet. First to fill
+    // wins — the other is cancelled. This cuts the "no match → wait → retry" cycle.
     const client = getClient();
-    let filled = false;
     let totalSharesFilled = 0;
     let totalCostFilled = 0;
+    let gtcOrderId = null;   // track GTC so we can cancel it if FAK fills first
+    let gtcDone = false;     // prevents double-resolution
 
-    const BUY_MAX_RETRIES = 1;
+    const BUY_MAX_RETRIES = config.maxRetries;
     const BUY_RETRY_DELAY = 1000;
 
-    for (let attempt = 1; attempt <= BUY_MAX_RETRIES; attempt++) {
+    // ── GTC background task ───────────────────────────────────────────────
+    const _runGtcBackground = async () => {
+        const gtcPrice = parseFloat(Math.min(price * 1.02, 0.99).toFixed(4));
+        const shares = parseFloat((tradeSize / gtcPrice).toFixed(4));
+
         try {
-            const remainingAmount = tradeSize - totalCostFilled;
-            if (remainingAmount < effectiveMin) {
-                if (remainingAmount > 0) logger.info(`Remaining $${remainingAmount.toFixed(2)} below $${effectiveMin} minimum — stopping`);
-                break;
+            const resp = await client.createAndPostOrder(
+                { tokenID: tokenId, side: Side.BUY, price: gtcPrice, size: shares },
+                { tickSize: marketOpts.tickSize, negRisk: marketOpts.negRisk },
+                OrderType.GTC,
+            );
+            if (!resp?.success) {
+                logger.warn(`GTC fallback rejected: ${resp?.errorMsg || 'unknown'}`);
+                return null;
             }
+            gtcOrderId = resp.orderID;
+            logger.info(`GTC placed in parallel: ${gtcOrderId?.slice(-8)} — waiting for fill`);
 
-            logger.info(`Buy attempt ${attempt}/${BUY_MAX_RETRIES} | Amount: $${remainingAmount.toFixed(2)}`);
+            // Poll until fill, cancelled, or timeout
+            const deadline = Date.now() + config.gtcFallbackTimeout * 1000;
+            while (Date.now() < deadline && !gtcDone) {
+                await new Promise((r) => setTimeout(r, 2000));
+                if (gtcDone) return null; // FAK already filled
+                try {
+                    const order = await client.getOrder(gtcOrderId);
+                    const matched = parseFloat(order?.size_matched ?? order?.matched_amount ?? '0');
+                    const status = (order?.status ?? order?.order_status ?? '').toLowerCase();
+                    if (matched > 0 || status === 'matched' || status === 'filled') {
+                        const filled_ = matched > 0 ? matched : shares;
+                        logger.success(`GTC filled in parallel: ${filled_.toFixed(4)} shares @ $${gtcPrice}`);
+                        return { sharesFilled: filled_, costFilled: filled_ * gtcPrice };
+                    }
+                    if (status === 'cancelled') return null;
+                } catch (_) { /* getOrder can 404 briefly */ }
+            }
+            // Timeout — cancel
+            try { await client.cancelOrder({ orderID: gtcOrderId }); } catch (_) { /* ignore */ }
+            return null;
+        } catch (err) {
+            logger.warn(`GTC fallback failed: ${err.message}`);
+            return null;
+        }
+    };
 
+    let gtcPromise = null; // started lazily after first FAK "no match"
+
+    // ── FAK retry loop (with parallel GTC) ────────────────────────────────
+    for (let attempt = 1; attempt <= BUY_MAX_RETRIES; attempt++) {
+        const remainingAmount = tradeSize - totalCostFilled;
+        if (remainingAmount < effectiveMin) {
+            if (remainingAmount > 0) logger.info(`Remaining $${remainingAmount.toFixed(2)} below $${effectiveMin} minimum — stopping`);
+            break;
+        }
+
+        logger.info(`Buy attempt ${attempt}/${BUY_MAX_RETRIES} | Amount: $${remainingAmount.toFixed(2)}`);
+
+        try {
             const response = await client.createAndPostMarketOrder(
-                {
-                    tokenID: tokenId,
-                    side: Side.BUY,
-                    amount: remainingAmount,
-                    orderType: OrderType.FAK,
-                },
-                {
-                    tickSize: marketOpts.tickSize,
-                    negRisk: marketOpts.negRisk,
-                },
+                { tokenID: tokenId, side: Side.BUY, amount: remainingAmount, orderType: OrderType.FAK },
+                { tickSize: marketOpts.tickSize, negRisk: marketOpts.negRisk },
                 OrderType.FAK,
             );
 
-            if (response && response.success) {
+            if (response?.success) {
                 const sharesFilled = parseFloat(response.takingAmount || '0');
-                const costFilled   = parseFloat(response.makingAmount || '0');
+                const costFilled = parseFloat(response.makingAmount || '0');
 
                 if (sharesFilled > 0) {
                     logger.success(`Order filled: ${response.orderID} | ${sharesFilled.toFixed(4)} shares @ ~$${(costFilled / sharesFilled).toFixed(4)}`);
                     totalSharesFilled += sharesFilled;
-                    totalCostFilled   += costFilled || (sharesFilled * price);
-                    filled = true;
-                    // If remainder is below $1 minimum, stop; otherwise loop for partial fill
+                    totalCostFilled += costFilled || (sharesFilled * price);
+                    // FAK filled — GTC no longer needed
+                    if (gtcOrderId) {
+                        gtcDone = true;
+                        try { await client.cancelOrder({ orderID: gtcOrderId }); } catch (_) { /* ignore */ }
+                    }
                     if (tradeSize - totalCostFilled < effectiveMin) break;
                 } else {
                     logger.warn(`No liquidity — FAK filled 0 shares (attempt ${attempt})`);
+                    // Start parallel GTC after first "no match" if not already running
+                    if (!gtcPromise && config.gtcFallbackTimeout > 0) {
+                        gtcPromise = _runGtcBackground();
+                    }
                 }
             } else {
                 logger.warn(`Order rejected: ${response?.errorMsg || 'unknown'}`);
@@ -309,22 +343,23 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
             logger.error(`Buy attempt ${attempt} failed: ${err.message}`);
         }
 
-        if (attempt < BUY_MAX_RETRIES) {
+        if (attempt < BUY_MAX_RETRIES && totalCostFilled === 0) {
             await new Promise((r) => setTimeout(r, BUY_RETRY_DELAY));
         }
     }
 
-    // FAK found no liquidity — fall back to GTC limit order and wait for fill
-    if (!filled && config.gtcFallbackTimeout > 0) {
-        const gtcResult = await _tryGtcFallback(client, tokenId, tradeSize, price, marketOpts);
+    // If FAK never filled but GTC was running, wait for its result
+    if (totalCostFilled === 0 && gtcPromise) {
+        const gtcResult = await gtcPromise;
         if (gtcResult) {
             totalSharesFilled = gtcResult.sharesFilled;
-            totalCostFilled   = gtcResult.costFilled;
-            filled = true;
+            totalCostFilled = gtcResult.costFilled;
+        } else {
+            logger.warn(`GTC fallback did not fill within ${config.gtcFallbackTimeout}s`);
         }
     }
 
-    if (!filled || totalCostFilled === 0) {
+    if (totalCostFilled === 0) {
         logger.error(`Failed to fill buy order for ${market || tokenId} after ${BUY_MAX_RETRIES} attempt(s)`);
         return;
     }
@@ -424,7 +459,7 @@ export async function executeSell(trade) {
             try {
                 await client.cancelOrder({ orderID: position.sellOrderId });
                 await new Promise((r) => setTimeout(r, 600));
-            } catch { /* ignore */ }
+            } catch (_) { /* ignore */ }
         }
         logger.warn(`Could not fetch open orders to cancel: ${err.message}`);
     }

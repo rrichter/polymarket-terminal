@@ -247,7 +247,8 @@ async function _doExecSafeCall(to, data, description = '', gasLimit = undefined)
 
 // In-memory approval cache — avoids redundant on-chain reads after first approval
 let _usdcApproved = false;
-const _exchangeApproved = new Set(); // exchange addresses already confirmed
+const _exchangeApproved = new Set();   // exchange addresses already confirmed
+const _exchangeApprovalFailed = new Set(); // exchanges where approval was attempted and failed — don't retry
 
 /**
  * Ensure the CTF contract can spend USDC from the proxy wallet.
@@ -272,26 +273,55 @@ async function ensureUsdcApproval(amountWei) {
 
 /**
  * Ensure the CTF exchange is an approved ERC1155 operator (needed for limit sell orders).
- * This is a one-time per-wallet setup.
+ * This is a one-time per-wallet setup. After the first check, in-memory caches prevent
+ * redundant RPC calls. If approval fails once, it's cached as failed and won't be retried.
  */
 export async function ensureExchangeApproval(negRisk = false) {
     const exchange = negRisk ? NEG_RISK_EXCHANGE : CTF_EXCHANGE;
     if (_exchangeApproved.has(exchange)) return;
+    if (_exchangeApprovalFailed.has(exchange)) return; // already tried and failed — skip
 
-    const provider = await getPolygonProvider();
-    const ctf = new ethers.Contract(CTF_ADDRESS, ERC1155_ABI, provider);
+    try {
+        const provider = await getPolygonProvider();
+        const ctf = new ethers.Contract(CTF_ADDRESS, ERC1155_ABI, provider);
 
-    const approved = await ctf.isApprovedForAll(config.proxyWallet, exchange);
-    if (approved) {
+        const approved = await ctf.isApprovedForAll(config.proxyWallet, exchange);
+        if (approved) {
+            _exchangeApproved.add(exchange);
+            logger.info(`CTF exchange already approved — skipping on-chain approval`);
+            return;
+        }
+
+        // Not yet approved — execute setApprovalForAll once
+        const iface = new ethers.utils.Interface(ERC1155_ABI);
+        const data = iface.encodeFunctionData('setApprovalForAll', [exchange, true]);
+        await execSafeCall(CTF_ADDRESS, data, 'setApprovalForAll → CTF Exchange');
         _exchangeApproved.add(exchange);
-        return;
+        logger.success(`CTF exchange approved as ERC1155 operator`);
+    } catch (err) {
+        _exchangeApprovalFailed.add(exchange);
+        logger.warn(`CTF exchange approval failed — will not retry. Error: ${err.message}`);
+        throw err;
     }
+}
 
-    const iface = new ethers.utils.Interface(ERC1155_ABI);
-    const data = iface.encodeFunctionData('setApprovalForAll', [exchange, true]);
-    await execSafeCall(CTF_ADDRESS, data, 'setApprovalForAll → CTF Exchange');
-    _exchangeApproved.add(exchange);
-    logger.success(`MM: CTF exchange approved as ERC1155 operator`);
+/**
+ * Pre-approve both CTF exchanges at startup.
+ * Call once after `initClient()`. If the wallet already has approvals set,
+ * this is a cheap read-only check. If not, it executes the approval tx once.
+ * Subsequent calls to `ensureExchangeApproval()` are no-ops.
+ */
+export async function preApproveExchanges() {
+    logger.info('Checking CTF exchange approvals...');
+    // Check both exchanges in parallel
+    const results = await Promise.allSettled([
+        ensureExchangeApproval(false), // CTF_EXCHANGE
+        ensureExchangeApproval(true),  // NEG_RISK_EXCHANGE
+    ]);
+    const ok = results.filter(r => r.status === 'fulfilled').length;
+    const fail = results.filter(r => r.status === 'rejected').length;
+    if (ok > 0) logger.success(`CTF approvals: ${ok} OK, ${fail} skipped (already approved or failed)`);
+    if (fail > 0) logger.warn(`${fail} CTF approval(s) failed — copy trading will still work, but limit sell orders may not`);
 }
 
 // ── Helper: Redeem after merge ───────────────────────────────────────────────

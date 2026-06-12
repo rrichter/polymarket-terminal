@@ -4,6 +4,8 @@ import { executeBuy, executeSell } from './services/executor.js';
 import { checkAndRedeemPositions } from './services/redeemer.js';
 import { getOpenPositions } from './services/position.js';
 import { startWsWatcher, stopWsWatcher } from './services/wsWatcher.js';
+import { preApproveExchanges } from './services/ctf.js';
+import { copyFillWatcher } from './services/copyFillWatcher.js';
 import { getSimStats } from './utils/simStats.js';
 import { initDashboard, appendLog, updateStatus } from './ui/dashboard.js';
 import logger from './utils/logger.js';
@@ -186,6 +188,20 @@ async function main() {
         process.exit(1);
     }
 
+    // Pre-approve CTF exchanges (one-time check — cheap read if already set)
+    try {
+        await preApproveExchanges();
+    } catch (err) {
+        logger.warn('CTF pre-approval check failed (non-fatal):', err.message);
+    }
+
+    // Start own-fill WebSocket watcher (detects auto-sell fills instantly)
+    copyFillWatcher.start();
+    copyFillWatcher.on('sellFilled', ({ tokenId, conditionId, shares, price }) => {
+        logger.money(`Own-fill detected: SELL ${shares} shares @ $${price} — token ${tokenId?.slice(-8)}`);
+        // The redeemer will handle position cleanup; this is an early notification.
+    });
+
     // Initial balance display
     try {
         const balance = await getUsdcBalance();
@@ -217,6 +233,7 @@ async function main() {
     const shutdown = () => {
         logger.info('Shutting down...');
         stopWsWatcher();
+        copyFillWatcher.stop();
         clearInterval(redeemerInterval);
         clearInterval(statusInterval);
         setTimeout(() => process.exit(0), 300);
