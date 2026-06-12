@@ -100,7 +100,6 @@ async function main() {
     logger.info(`Max position : $${config.maxPositionSize} per market`);
     logger.info(`Auto sell    : ${config.autoSellEnabled ? `ON (+${config.autoSellProfitPercent}%)` : 'OFF'}`);
     logger.info(`Sell mode    : ${config.sellMode}`);
-    logger.info(`Min time left: ${config.minMarketTimeLeft}s`);
     logger.info('==========================================');
 
     try {

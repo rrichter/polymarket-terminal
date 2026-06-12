@@ -46,9 +46,6 @@ const config = {
   maxRetries: 5,
   retryDelay: 3000,
 
-  // Skip buy if market closes within this many seconds (default 5 minutes)
-  minMarketTimeLeft: parseInt(process.env.MIN_MARKET_TIME_LEFT || '300', 10),
-
   // Seconds to wait for a GTC limit order to fill when FAK finds no liquidity
   // (happens when copying trades into "next market" before sellers arrive)
   gtcFallbackTimeout: parseInt(process.env.GTC_FALLBACK_TIMEOUT || '60', 10),

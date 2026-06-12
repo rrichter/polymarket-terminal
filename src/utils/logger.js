@@ -43,7 +43,8 @@ function sanitizeClobMessage(raw) {
 }
 
 function ts() {
-    return new Date().toISOString().replace('T', ' ').substring(0, 19);
+    // "2026-06-12T01:31:27.123Z" → "2026-06-12 01:31:27.123"
+    return new Date().toISOString().replace('T', ' ').replace('Z', '').substring(0, 23);
 }
 
 function stringify(args) {

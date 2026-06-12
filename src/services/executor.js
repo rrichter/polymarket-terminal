@@ -182,30 +182,10 @@ async function _tryGtcFallback(client, tokenId, tradeSize, price, marketOpts) {
 async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
     const { tokenId, conditionId, market, price, size } = trade;
 
-    // ── Market expiry guard ────────────────────────────────────────────────────
+    // ── Market closed / not accepting orders guard ─────────────────────────────
     if (!marketOpts.active || !marketOpts.acceptingOrders) {
         logger.warn(`Market closed/not accepting orders: ${market || effectiveConditionId} — skipping buy`);
         return;
-    }
-    if (marketOpts.endDateIso) {
-        // Gamma API returns endDate as Unix timestamp (seconds), not ISO string.
-        // new Date("1749696000") interprets as ms → date in 1970.
-        let endMs;
-        if (/^\d{10}$/.test(String(marketOpts.endDateIso))) {
-            endMs = Number(marketOpts.endDateIso) * 1000;  // seconds → ms
-        } else {
-            endMs = new Date(marketOpts.endDateIso).getTime();
-        }
-        const secsLeft = (endMs - Date.now()) / 1000;
-        if (secsLeft < config.minMarketTimeLeft) {
-            const minsLeft = Math.max(0, Math.floor(secsLeft / 60));
-            const sLeft    = Math.max(0, Math.floor(secsLeft % 60));
-            logger.warn(
-                `Market expires in ${minsLeft}m ${sLeft}s — below MIN_MARKET_TIME_LEFT ` +
-                `(${config.minMarketTimeLeft}s). Skipping buy: ${market || effectiveConditionId}`,
-            );
-            return;
-        }
     }
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -281,7 +261,10 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
     let totalSharesFilled = 0;
     let totalCostFilled = 0;
 
-    for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
+    const BUY_MAX_RETRIES = 1;
+    const BUY_RETRY_DELAY = 1000;
+
+    for (let attempt = 1; attempt <= BUY_MAX_RETRIES; attempt++) {
         try {
             const remainingAmount = tradeSize - totalCostFilled;
             if (remainingAmount < effectiveMin) {
@@ -289,7 +272,7 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
                 break;
             }
 
-            logger.info(`Buy attempt ${attempt}/${config.maxRetries} | Amount: $${remainingAmount.toFixed(2)}`);
+            logger.info(`Buy attempt ${attempt}/${BUY_MAX_RETRIES} | Amount: $${remainingAmount.toFixed(2)}`);
 
             const response = await client.createAndPostMarketOrder(
                 {
@@ -326,8 +309,8 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
             logger.error(`Buy attempt ${attempt} failed: ${err.message}`);
         }
 
-        if (attempt < config.maxRetries) {
-            await new Promise((r) => setTimeout(r, config.retryDelay));
+        if (attempt < BUY_MAX_RETRIES) {
+            await new Promise((r) => setTimeout(r, BUY_RETRY_DELAY));
         }
     }
 
@@ -342,7 +325,7 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
     }
 
     if (!filled || totalCostFilled === 0) {
-        logger.error(`Failed to fill buy order for ${market || tokenId} after ${config.maxRetries} attempts`);
+        logger.error(`Failed to fill buy order for ${market || tokenId} after ${BUY_MAX_RETRIES} attempt(s)`);
         return;
     }
 
