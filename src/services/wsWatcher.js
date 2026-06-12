@@ -11,6 +11,9 @@ const PROCESSED_FILE = 'processed_trades.json';
 const MAX_PROCESSED_IDS = 10_000;    // in-memory cap, pruned periodically
 const FLUSH_INTERVAL_MS = 30_000;    // flush to disk every 30s
 
+// Set DEBUG_RTDS=true in .env to log raw RTDS activity payloads (for diagnosing missed trades)
+const DEBUG_RTDS = process.env.DEBUG_RTDS === 'true';
+
 let ws = null;
 let pingTimer = null;
 let reconnectTimer = null;
@@ -18,6 +21,12 @@ let reconnectDelay = INITIAL_RECONNECT_DELAY;
 let tradeHandler = null;
 let isShuttingDown = false;
 let _flushTimer = null;
+
+// Track stats for diagnosing missed trades
+let _msgCount = 0;
+let _activityCount = 0;
+let _filteredCount = 0;
+let _matchedCount = 0;
 
 // ── In-memory dedup Set — avoids synchronous disk I/O on every trade event ──
 // Initialized on connect(), loaded from processed_trades.json for crash recovery.
@@ -85,17 +94,24 @@ function markProcessed(tradeId) {
     return true;
 }
 
+/** Pure check — returns true if trade ID was already processed (no side effect). */
+function hasProcessed(tradeId) {
+    return _processedIds.has(tradeId);
+}
+
 function handleMessage(rawData) {
     let msg;
     try {
         msg = JSON.parse(rawData.toString());
-    } catch {
+    } catch (_) {
         const text = rawData.toString().trim();
         if (text === 'ping') {
             ws?.send('pong');
         }
         return;
     }
+
+    _msgCount++;
 
     // Handle ping/heartbeat
     if (msg.type === 'ping' || msg === 'ping') {
@@ -106,14 +122,32 @@ function handleMessage(rawData) {
     // Only process activity trade events
     if (msg.topic !== 'activity') return;
 
+    _activityCount++;
     const payload = msg.payload;
     if (!payload) return;
 
-    // Filter by target trader's address (case-insensitive)
-    const traderAddr = config.traderAddress.toLowerCase();
-    const proxyWallet = (payload.proxyWallet || payload.proxy_wallet || '').toLowerCase();
+    // ── DEBUG: log raw payload to diagnose missed trades ───────────────
+    if (DEBUG_RTDS && _activityCount <= 50) {
+        // Log first 50 activity events with their field names
+        const keys = Object.keys(payload).join(', ');
+        const side = payload.side || payload.type || payload.direction || '?';
+        const wallet = payload.proxyWallet || payload.proxy_wallet || payload.user || payload.owner || payload.maker || '?';
+        logger.info(`RTDS DEBUG #${_activityCount}: side="${side}" wallet="${typeof wallet === 'string' ? wallet.slice(0, 12) : '?'}…" asset="${(payload.asset || '?').slice(0, 16)}…" fields=[${keys}]`);
+    }
 
-    if (!proxyWallet || proxyWallet !== traderAddr) return;
+    // Filter by target trader's address (case-insensitive)
+    // Try multiple common field names — Polymarket RTDS may use any of these
+    const traderAddr = config.traderAddress.toLowerCase();
+    const walletField = payload.proxyWallet || payload.proxy_wallet ||
+                        payload.user || payload.owner || payload.maker || '';
+    const proxyWallet = (typeof walletField === 'string' ? walletField : '').toLowerCase();
+
+    if (!proxyWallet || proxyWallet !== traderAddr) {
+        _filteredCount++;
+        return;
+    }
+
+    _matchedCount++;
 
     // Build trade ID
     const tradeId = payload.transactionHash || payload.transaction_hash ||
@@ -232,6 +266,14 @@ function connect() {
         }));
 
         startPing();
+
+        // Log WebSocket stats every 5 minutes for health monitoring
+        const statsInterval = setInterval(() => {
+            if (isShuttingDown) { clearInterval(statsInterval); return; }
+            if (_activityCount > 0) {
+                logger.info(`WS stats: ${_msgCount} msgs, ${_activityCount} activities, ${_matchedCount} matched, ${_filteredCount} filtered (non-trader)`);
+            }
+        }, 300_000);
     });
 
     ws.on('message', (data) => {
@@ -273,3 +315,10 @@ export function stopWsWatcher() {
     cleanup(false);
     logger.info('WebSocket watcher stopped');
 }
+
+/**
+ * Exported for use by the polling safety net.
+ * Checks whether a trade ID has already been processed (in-memory dedup).
+ * Returns true if NEW (not previously seen), false if duplicate.
+ */
+export { markProcessed, hasProcessed };

@@ -3,7 +3,8 @@ import { initClient, getUsdcBalance, getClient } from './services/client.js';
 import { executeBuy, executeSell } from './services/executor.js';
 import { checkAndRedeemPositions } from './services/redeemer.js';
 import { getOpenPositions } from './services/position.js';
-import { startWsWatcher, stopWsWatcher } from './services/wsWatcher.js';
+import { startWsWatcher, stopWsWatcher, markProcessed, hasProcessed } from './services/wsWatcher.js';
+import { checkNewTrades } from './services/watcher.js';
 import { preApproveExchanges } from './services/ctf.js';
 import { copyFillWatcher } from './services/copyFillWatcher.js';
 import { getSimStats } from './utils/simStats.js';
@@ -222,6 +223,45 @@ async function main() {
     // Start real-time WebSocket watcher
     startWsWatcher(handleTrade);
 
+    // ── Polling safety net: catch trades missed during WS disconnects ──────
+    // Runs every 30s via the Data API as a backup to the real-time WebSocket.
+    // The Data API has ~5-10s lag but catches everything — critical for trades
+    // that occurred while the WS was reconnecting or before bot startup.
+    const pollSafetyNet = async () => {
+        try {
+            const trades = await checkNewTrades();
+            if (trades.length > 0) {
+                let processed = 0;
+                for (const trade of trades) {
+                    // Check against WS dedup BEFORE processing (no side effects).
+                    // The WS watcher uses `transactionHash` as the key, while
+                    // the Data API poller uses `txHash_asset_side`. Check both.
+                    if (hasProcessed(trade.id) || (trade.txHash && hasProcessed(trade.txHash))) {
+                        continue; // already seen by WebSocket
+                    }
+                    try {
+                        await handleTrade(trade);
+                        // Only mark AFTER successful processing — if handleTrade
+                        // throws, we'll retry on the next poll cycle.
+                        markProcessed(trade.id);
+                        if (trade.txHash) markProcessed(trade.txHash);
+                        processed++;
+                    } catch (err) {
+                        logger.error(`Polling safety net: trade failed — will retry: ${err.message}`);
+                    }
+                }
+                if (processed > 0) {
+                    logger.warn(`Polling safety net: caught ${processed} missed trade(s) — WS may have been disconnected`);
+                }
+            }
+        } catch (_) {
+            // Silent — don't spam if Data API is temporarily down
+        }
+    };
+    const pollInterval = setInterval(pollSafetyNet, 30_000);
+    // Run immediately at startup to catch trades from before bot launched
+    pollSafetyNet().catch(() => {});
+
     // Run redeemer immediately then on interval
     await redeemerLoop();
     const redeemerInterval = setInterval(redeemerLoop, config.redeemInterval);
@@ -234,6 +274,7 @@ async function main() {
         logger.info('Shutting down...');
         stopWsWatcher();
         copyFillWatcher.stop();
+        clearInterval(pollInterval);
         clearInterval(redeemerInterval);
         clearInterval(statusInterval);
         setTimeout(() => process.exit(0), 300);
