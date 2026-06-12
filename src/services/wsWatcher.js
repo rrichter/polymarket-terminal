@@ -10,6 +10,7 @@ const MAX_RECONNECT_DELAY = 30000;
 const PROCESSED_FILE = 'processed_trades.json';
 const MAX_PROCESSED_IDS = 10_000;    // in-memory cap, pruned periodically
 const FLUSH_INTERVAL_MS = 30_000;    // flush to disk every 30s
+const HEARTBEAT_TIMEOUT_MS = 45_000; // if no message in 45s, force reconnect
 
 // Set DEBUG_RTDS=true in .env to log raw RTDS activity payloads (for diagnosing missed trades)
 const DEBUG_RTDS = process.env.DEBUG_RTDS === 'true';
@@ -27,6 +28,9 @@ let _msgCount = 0;
 let _activityCount = 0;
 let _filteredCount = 0;
 let _matchedCount = 0;
+let _lastMessageTime = Date.now();
+let _statsInterval = null;
+let _heartbeatMonitor = null;
 
 // ── In-memory dedup Set — avoids synchronous disk I/O on every trade event ──
 // Initialized on connect(), loaded from processed_trades.json for crash recovery.
@@ -80,6 +84,53 @@ function _stopFlushTimer() {
     }
 }
 
+/** Start heartbeat monitor — forces reconnect if no message received within HEARTBEAT_TIMEOUT_MS. */
+function _startHeartbeatMonitor() {
+    _stopHeartbeatMonitor();
+    _lastMessageTime = Date.now();
+    _heartbeatMonitor = setInterval(() => {
+        if (isShuttingDown) return;
+        const idle = Date.now() - _lastMessageTime;
+        if (idle > HEARTBEAT_TIMEOUT_MS) {
+            logger.warn(`No WebSocket message for ${Math.round(idle / 1000)}s — forcing reconnect`);
+            if (ws) {
+                ws.terminate(); // hard kill, triggers 'close' → cleanup → reconnect
+            }
+        }
+    }, 10_000);
+}
+
+/** Stop heartbeat monitor. */
+function _stopHeartbeatMonitor() {
+    if (_heartbeatMonitor) {
+        clearInterval(_heartbeatMonitor);
+        _heartbeatMonitor = null;
+    }
+}
+
+/** Start periodic WS stats logging (every 5 min). */
+function _startStatsInterval() {
+    _stopStatsInterval();
+    _statsInterval = setInterval(() => {
+        if (isShuttingDown) return;
+        if (_activityCount > 0) {
+            const idle = Math.round((Date.now() - _lastMessageTime) / 1000);
+            logger.info(
+                `WS stats: ${_msgCount} msgs, ${_activityCount} activities, ` +
+                `${_matchedCount} matched, ${_filteredCount} filtered | idle: ${idle}s`
+            );
+        }
+    }, 300_000);
+}
+
+/** Stop periodic WS stats logging. */
+function _stopStatsInterval() {
+    if (_statsInterval) {
+        clearInterval(_statsInterval);
+        _statsInterval = null;
+    }
+}
+
 /** Check-and-insert a trade ID. Returns true if new (not previously seen). */
 function markProcessed(tradeId) {
     if (_processedIds.has(tradeId)) return false;
@@ -100,6 +151,8 @@ function hasProcessed(tradeId) {
 }
 
 function handleMessage(rawData) {
+    _lastMessageTime = Date.now();
+
     let msg;
     try {
         msg = JSON.parse(rawData.toString());
@@ -215,6 +268,8 @@ function stopPing() {
 function cleanup(reconnect = true) {
     stopPing();
     _stopFlushTimer();
+    _stopHeartbeatMonitor();
+    _stopStatsInterval();
     _flushToDisk(); // persist on disconnect
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
@@ -266,14 +321,8 @@ function connect() {
         }));
 
         startPing();
-
-        // Log WebSocket stats every 5 minutes for health monitoring
-        const statsInterval = setInterval(() => {
-            if (isShuttingDown) { clearInterval(statsInterval); return; }
-            if (_activityCount > 0) {
-                logger.info(`WS stats: ${_msgCount} msgs, ${_activityCount} activities, ${_matchedCount} matched, ${_filteredCount} filtered (non-trader)`);
-            }
-        }, 300_000);
+        _startHeartbeatMonitor();
+        _startStatsInterval();
     });
 
     ws.on('message', (data) => {
