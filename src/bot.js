@@ -7,10 +7,11 @@
  */
 import config, { validateConfig } from './config/index.js';
 import { initClient, getClient, getClobBalance } from './services/client.js';
-import { executeBuy, executeSell } from './services/executor.js';
+import { executeBuy, executeSell, getOnChainTokenBalance } from './services/executor.js';
 import { checkAndRedeemPositions } from './services/redeemer.js';
-import { getOpenPositions } from './services/position.js';
+import { getOpenPositions, updatePosition, removePosition } from './services/position.js';
 import { startWsWatcher, stopWsWatcher } from './services/wsWatcher.js';
+import { copyFillWatcher } from './services/copyFillWatcher.js';
 import { getSimStats } from './utils/simStats.js';
 import logger from './utils/logger.js';
 
@@ -26,15 +27,73 @@ async function handleTrade(trade) {
     }
 }
 
+// ── Parse weather market title ────────────────────────────────────────────────
+function parseWeatherTitle(rawName) {
+    const match = rawName.match(/^Will the highest temperature in (.+?) be between (.+?) on (.+?)\??$/);
+    return match ? { city: match[1], tempRange: match[2], date: match[3] } : null;
+}
+
+function dateSortKey(dateStr) {
+    const months = { january:1,february:2,march:3,april:4,may:5,june:6,
+                     july:7,august:8,september:9,october:10,november:11,december:12 };
+    const m = dateStr.match(/^([A-Za-z]+)\s+(\d+)$/);
+    return m ? (months[m[1].toLowerCase()] || 0) * 100 + parseInt(m[2], 10) : 0;
+}
+
+function tempSortKey(tempStr) {
+    const m = tempStr.match(/^(\d+)/);
+    return m ? parseInt(m[1], 10) : 0;
+}
+
 // ── Periodic status log (replaces TUI right panel) ────────────────────────────
 async function printStatus() {
     try {
         const balance   = await getClobBalance();
         const positions = getOpenPositions();
 
-        logger.info(`--- Status | Balance: $${balance.toFixed(2)} USDC | Open positions: ${positions.length} ---`);
-
+        // ── Reconcile positions against on-chain balances ─────────────────
+        // Catches partial fills, manual sells, and any drift that the WS
+        // fill watcher might have missed (e.g., during reconnects).
         for (const pos of positions) {
+            try {
+                const onChain = await getOnChainTokenBalance(pos.tokenId);
+                if (onChain !== null) {
+                    if (onChain < 0.0001) {
+                        logger.info(`On-chain balance is 0 — removing position: ${pos.market}`);
+                        removePosition(pos.conditionId);
+                    } else if (Math.abs(onChain - pos.shares) > 0.001) {
+                        logger.info(`Reconciling shares for ${pos.market}: stored ${pos.shares.toFixed(4)} → on-chain ${onChain.toFixed(4)}`);
+                        const ratio = onChain / pos.shares;
+                        updatePosition(pos.conditionId, {
+                            shares: onChain,
+                            totalCost: (pos.totalCost || 0) * ratio,
+                        });
+                    }
+                }
+            } catch { /* skip individual reconciliation errors */ }
+        }
+
+        // Refetch after reconciliation (some positions may have been removed)
+        const current = getOpenPositions();
+
+        logger.info(`--- Status | Balance: $${balance.toFixed(2)} USDC | Open positions: ${current.length} ---`);
+
+        // Parse & sort: city → date → temperature
+        const sorted = current.map(pos => {
+            const parsed = parseWeatherTitle(pos.market || '');
+            return { pos, parsed };
+        }).sort((a, b) => {
+            if (!a.parsed && !b.parsed) return 0;
+            if (!a.parsed) return 1;
+            if (!b.parsed) return -1;
+            const cityCmp = a.parsed.city.localeCompare(b.parsed.city);
+            if (cityCmp !== 0) return cityCmp;
+            const dateCmp = dateSortKey(a.parsed.date) - dateSortKey(b.parsed.date);
+            if (dateCmp !== 0) return dateCmp;
+            return tempSortKey(a.parsed.tempRange) - tempSortKey(b.parsed.tempRange);
+        });
+
+        for (const { pos } of sorted) {
             let pnlStr = '';
             try {
                 const client = getClient();
@@ -48,7 +107,10 @@ async function printStatus() {
                 }
             } catch { /* price unavailable */ }
 
-            const name = (pos.market || pos.tokenId || '').substring(0, 50);
+            const parsed = parseWeatherTitle(pos.market || '');
+            const name = parsed
+                ? `${parsed.city} | ${parsed.date} | ${parsed.tempRange}`
+                : (pos.market || pos.tokenId || '');
             logger.info(
                 `  [${pos.outcome || '?'}] ${name}` +
                 ` | ${pos.shares.toFixed(4)} sh @ $${pos.avgBuyPrice.toFixed(4)}` +
@@ -125,6 +187,40 @@ async function main() {
 
     startWsWatcher(handleTrade);
 
+    // ── Own-fill watcher: detect when our sell orders execute ─────────────
+    // Keeps positions.json in sync for partial fills and auto-sell GTC fills
+    // that happen asynchronously (not triggered by a trader's sell signal).
+    copyFillWatcher.start();
+    copyFillWatcher.on('sellFilled', ({ tokenId, conditionId, shares, price }) => {
+        // Try to find the position by conditionId
+        const positions = getOpenPositions();
+        const pos = positions.find(p => p.conditionId === conditionId);
+        if (!pos) {
+            // Fallback: search by tokenId
+            const byToken = positions.find(p => p.tokenId === tokenId);
+            if (!byToken) return;
+            const remaining = byToken.shares - shares;
+            if (remaining < 0.0001) {
+                logger.money(`Position fully sold (own-fill): ${byToken.market} | ${shares} sh @ $${price.toFixed(4)}`);
+                removePosition(byToken.conditionId);
+            } else {
+                const remainingCost = remaining * byToken.avgBuyPrice;
+                updatePosition(byToken.conditionId, { shares: remaining, totalCost: remainingCost, status: 'open' });
+                logger.money(`Partial sell (own-fill): ${byToken.market} | ${shares} sh filled, ${remaining.toFixed(4)} remaining`);
+            }
+            return;
+        }
+        const remaining = pos.shares - shares;
+        if (remaining < 0.0001) {
+            logger.money(`Position fully sold (own-fill): ${pos.market} | ${shares} sh @ $${price.toFixed(4)}`);
+            removePosition(conditionId);
+        } else {
+            const remainingCost = remaining * pos.avgBuyPrice;
+            updatePosition(conditionId, { shares: remaining, totalCost: remainingCost, status: 'open' });
+            logger.money(`Partial sell (own-fill): ${pos.market} | ${shares} sh filled, ${remaining.toFixed(4)} remaining`);
+        }
+    });
+
     await redeemerLoop();
     const redeemerInterval = setInterval(redeemerLoop, config.redeemInterval);
 
@@ -134,6 +230,7 @@ async function main() {
     const shutdown = () => {
         logger.info('Shutting down...');
         stopWsWatcher();
+        copyFillWatcher.stop();
         clearInterval(redeemerInterval);
         clearInterval(statusInterval);
         setTimeout(() => process.exit(0), 300);

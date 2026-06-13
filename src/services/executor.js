@@ -33,7 +33,7 @@ const _batchWindows = new Map(); // conditionId → { entries: [], timer: Timer,
  * Fetch the actual on-chain ERC-1155 balance for a conditional token.
  * Returns shares as a plain float (6-decimal conversion).
  */
-async function getOnChainTokenBalance(tokenId) {
+export async function getOnChainTokenBalance(tokenId) {
     try {
         const provider = await getPolygonProvider();
         const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI_BALANCE, provider);
@@ -51,12 +51,12 @@ async function getOnChainTokenBalance(tokenId) {
  * Limit orders can be filled in many small chunks; using the event's fill size
  * would give inconsistent (often sub-minimum) results.
  *
- * SIZE_MODE=percentage → SIZE_PERCENT% of MAX_POSITION_SIZE per market
+ * SIZE_MODE=percentage → SIZE_PERCENT% of the trader's trade size (copy X% of their bet)
  * SIZE_MODE=balance    → SIZE_PERCENT% of our current USDC.e balance
  */
-async function calculateTradeSize() {
+async function calculateTradeSize(traderSize) {
     if (config.sizeMode === 'percentage') {
-        return config.maxPositionSize * (config.sizePercent / 100);
+        return (traderSize || 0) * (config.sizePercent / 100);
     } else if (config.sizeMode === 'balance') {
         const balance = await _getCachedBalance();
         return balance * (config.sizePercent / 100);
@@ -184,8 +184,10 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
         logger.info(`Adding to existing position (spent $${spent.toFixed(2)} / $${config.maxPositionSize})`);
     }
 
-    // Calculate our trade size (independent of individual fill event)
-    let tradeSize = await calculateTradeSize();
+    // Calculate our trade size: SIZE_PERCENT% of the trader's USDC spend
+    // trade.size is in SHARES — convert to USDC: shares × price
+    const traderUsdc = (size || 0) * (price || 0);
+    let tradeSize = await calculateTradeSize(traderUsdc);
 
     // Cap so we don't exceed maxPositionSize
     if (existingPos) {
@@ -495,7 +497,8 @@ export async function executeSell(trade) {
     // Round down to 4 decimal places to avoid sub-unit precision errors
     sharesToSell = Math.floor(sharesToSell * 10000) / 10000;
 
-    let filled = false;
+    let totalFilledShares = 0;
+    let orderPlaced = false;
 
     for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
         try {
@@ -521,10 +524,14 @@ export async function executeSell(trade) {
                     const sharesFilled = parseFloat(response.takingAmount || '0');
                     if (sharesFilled > 0) {
                         logger.success(`Sell filled: ${response.orderID} | ${sharesFilled.toFixed(4)} shares`);
-                        filled = true;
-                        break;
+                        totalFilledShares += sharesFilled;
+                        // Retry if we still have shares left to sell
+                        sharesToSell = Math.max(0, sharesToSell - sharesFilled);
+                        if (sharesToSell < 0.0001) break;
+                        logger.info(`Partial fill — ${sharesToSell.toFixed(4)} shares remaining to sell`);
                     } else {
                         logger.warn(`No bid liquidity — FAK filled 0 shares (attempt ${attempt})`);
+                        break; // no point retrying if no liquidity
                     }
                 } else {
                     logger.warn(`Sell rejected: ${response?.errorMsg || 'unknown'}`);
@@ -549,7 +556,7 @@ export async function executeSell(trade) {
 
                 if (response && response.success) {
                     logger.success(`Limit sell placed: ${response.orderID} @ $${price}`);
-                    filled = true;
+                    orderPlaced = true;
                     break;
                 } else {
                     logger.warn(`Limit sell failed: ${response?.errorMsg || 'Unknown'}`);
@@ -564,11 +571,33 @@ export async function executeSell(trade) {
         }
     }
 
-    if (filled) {
-        removePosition(effectiveConditionId);
-        logger.money(`Position sold: ${position.market}`);
+    if (config.sellMode === 'market') {
+        if (totalFilledShares > 0) {
+            const remaining = position.shares - totalFilledShares;
+            if (remaining < 0.0001) {
+                removePosition(effectiveConditionId);
+                logger.money(`Position fully sold: ${position.market}`);
+            } else {
+                // Partial fill — update position with remaining shares
+                const remainingCost = remaining * position.avgBuyPrice;
+                updatePosition(effectiveConditionId, {
+                    shares: remaining,
+                    totalCost: remainingCost,
+                    status: 'open',
+                });
+                logger.money(`Position partially sold: ${position.market} | ${totalFilledShares.toFixed(4)} filled, ${remaining.toFixed(4)} remaining`);
+            }
+        } else {
+            updatePosition(effectiveConditionId, { status: 'open' });
+            logger.error(`Failed to sell ${position.market} after ${config.maxRetries} attempts`);
+        }
     } else {
-        updatePosition(effectiveConditionId, { status: 'open' });
-        logger.error(`Failed to sell ${position.market} after ${config.maxRetries} attempts`);
+        // Limit sell (GTC) — order placed, fill watcher will handle updates
+        if (orderPlaced) {
+            updatePosition(effectiveConditionId, { status: 'selling' });
+        } else {
+            updatePosition(effectiveConditionId, { status: 'open' });
+            logger.error(`Failed to place limit sell for ${position.market} after ${config.maxRetries} attempts`);
+        }
     }
 }
