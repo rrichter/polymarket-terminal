@@ -38,6 +38,21 @@ export class TTLCache {
     }
 
     /**
+     * Synchronous peek — returns the cached value without calling the factory.
+     * Returns undefined if the key is missing or expired.
+     *
+     * @param {string} key
+     * @returns {any|undefined}
+     */
+    peek(key) {
+        const entry = this._map.get(key);
+        if (entry && entry.expiresAt > Date.now()) {
+            return entry.value;
+        }
+        return undefined;
+    }
+
+    /**
      * Store a value in the cache.
      */
     set(key, value) {

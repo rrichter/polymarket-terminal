@@ -7,7 +7,7 @@
  */
 import config, { validateConfig } from './config/index.js';
 import { initClient, getClient, getClobBalance } from './services/client.js';
-import { executeBuy, executeSell, getOnChainTokenBalance } from './services/executor.js';
+import { executeBuy, executeSell } from './services/executor.js';
 import { checkAndRedeemPositions } from './services/redeemer.js';
 import { getOpenPositions, updatePosition, removePosition } from './services/position.js';
 import { startWsWatcher, stopWsWatcher } from './services/wsWatcher.js';
@@ -49,32 +49,7 @@ function tempSortKey(tempStr) {
 async function printStatus() {
     try {
         const balance   = await getClobBalance();
-        const positions = getOpenPositions();
-
-        // ── Reconcile positions against on-chain balances ─────────────────
-        // Catches partial fills, manual sells, and any drift that the WS
-        // fill watcher might have missed (e.g., during reconnects).
-        for (const pos of positions) {
-            try {
-                const onChain = await getOnChainTokenBalance(pos.tokenId);
-                if (onChain !== null) {
-                    if (onChain < 0.0001) {
-                        logger.info(`On-chain balance is 0 — removing position: ${pos.market}`);
-                        removePosition(pos.conditionId);
-                    } else if (Math.abs(onChain - pos.shares) > 0.001) {
-                        logger.info(`Reconciling shares for ${pos.market}: stored ${pos.shares.toFixed(4)} → on-chain ${onChain.toFixed(4)}`);
-                        const ratio = onChain / pos.shares;
-                        updatePosition(pos.conditionId, {
-                            shares: onChain,
-                            totalCost: (pos.totalCost || 0) * ratio,
-                        });
-                    }
-                }
-            } catch { /* skip individual reconciliation errors */ }
-        }
-
-        // Refetch after reconciliation (some positions may have been removed)
-        const current = getOpenPositions();
+        const current    = getOpenPositions();
 
         logger.info(`--- Status | Balance: $${balance.toFixed(2)} USDC | Open positions: ${current.length} ---`);
 

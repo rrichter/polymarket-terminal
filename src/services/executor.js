@@ -23,11 +23,11 @@ async function _getCachedBalance() {
     return _balanceCache.get('clobBalance', () => getClobBalance());
 }
 
-// Per-market buy batching: when multiple BUY signals for the same market arrive
-// within BATCH_WINDOW_MS, they're merged into one combined order. This prevents
-// the second signal from waiting behind the first (which caused 19s delays).
-const BATCH_WINDOW_MS = 500;
-const _batchWindows = new Map(); // conditionId → { entries: [], timer: Timer, resolve: fn, promise: Promise }
+// Per-market in-flight lock: when a BUY is being executed for a conditionId,
+// concurrent signals for the same market are skipped (the in-flight order covers both).
+// This replaces the old 500ms batch window, saving ~500ms per trade.
+const IN_FLIGHT_LOCK_TIMEOUT_MS = 30_000;
+const _inFlightBuys = new Map(); // conditionId → { timer: Timer }
 
 /**
  * Fetch the actual on-chain ERC-1155 balance for a conditional token.
@@ -66,17 +66,75 @@ async function calculateTradeSize(traderSize) {
 
 /**
  * Get market options (tick size and neg risk) for a token.
- * Results are cached per tokenId with a 5-minute TTL — market metadata
- * (tickSize, negRisk, conditionId) does not change during a market's lifetime.
+ * Results are cached per tokenId with a 5-minute TTL.
+ *
+ * ON CACHE MISS: returns safe defaults immediately (tickSize 0.01, negRisk false)
+ * The CLOB SDK is tried first (authoritative, fast). If the cache is cold,
+ * we await the SDK call with a 3s timeout — this ensures the order signature
+ * is computed with the correct tick size. Returning blind defaults caused
+ * "POLY_1271 signature does not match order hash" errors when the actual
+ * market tick size differed from 0.01.
  */
 async function getMarketOptions(tokenId) {
+    // Fast path: cache hit — return synchronously (peek avoids factory invocation)
+    const cached = _marketOptsCache.peek(tokenId);
+    if (cached !== undefined) {
+        return cached;
+    }
+
+    // Cache miss — await the population so we have the real tick size.
+    // The CLOB SDK call is typically <200ms; we cap at 3s to avoid hanging.
+    try {
+        const result = await Promise.race([
+            _warmMarketOptsCache(tokenId),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000)),
+        ]);
+        return result;
+    } catch (err) {
+        // Timeout or error — fall back to safe defaults (tick 0.01 covers most markets)
+        logger.warn(`Market-options lookup timed out for ${tokenId?.slice(-8)}, using defaults — some orders may fail signature check`);
+        return {
+            tickSize: '0.01',
+            negRisk: false,
+            conditionId: '',
+            question: '',
+            endDateIso: null,
+            active: true,
+            acceptingOrders: true,
+        };
+    }
+}
+
+/**
+ * Populate the market-options cache in the background.
+ * Called without await from getMarketOptions() on cache miss.
+ *
+ * Tries the CLOB SDK first (authoritative for what the exchange accepts),
+ * then falls back to the Gamma API. Applies a 0.01 minimum tick floor —
+ * Polymarket's CLOB enforces this for the vast majority of markets.
+ */
+async function _warmMarketOptsCache(tokenId) {
     return _marketOptsCache.get(tokenId, async () => {
         const client = getClient();
+        // ── Primary: CLOB SDK (authoritative) ──────────────────────────
+        try {
+            const tickSize = await client.getTickSize(tokenId);
+            const negRisk = await client.getNegRisk(tokenId);
+            const rawTick = parseFloat(String(tickSize));
+            const safeTick = String(rawTick >= 0.01 ? rawTick : 0.01);
+            return { tickSize: safeTick, negRisk, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
+        } catch (err) {
+            logger.warn('CLOB SDK tick size failed, trying Gamma API:', err.message);
+        }
+
+        // ── Fallback: Gamma API (may return optimistic tick sizes) ──────
         try {
             const marketInfo = await fetchMarketByTokenId(tokenId);
             if (marketInfo) {
+                const rawTick = parseFloat(marketInfo.orderPriceMinTickSize || '0.01');
+                const safeTick = String(rawTick >= 0.01 ? rawTick : 0.01);
                 return {
-                    tickSize:        String(marketInfo.orderPriceMinTickSize || '0.01'),
+                    tickSize:        safeTick,
                     negRisk:         marketInfo.negRisk || false,
                     conditionId:     marketInfo.conditionId || '',
                     question:        marketInfo.question || '',
@@ -86,80 +144,169 @@ async function getMarketOptions(tokenId) {
                 };
             }
         } catch (err) {
-            logger.warn('Failed to get market info, using defaults:', err.message);
+            logger.warn('Gamma API market info failed:', err.message);
         }
 
-        // Fallback: try SDK methods
-        try {
-            const tickSize = await client.getTickSize(tokenId);
-            const negRisk = await client.getNegRisk(tokenId);
-            return { tickSize: String(tickSize), negRisk, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
-        } catch (err) {
-            logger.warn('Failed to get tick size from SDK, using default 0.01');
-            return { tickSize: '0.01', negRisk: false, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
-        }
+        // ── Last resort ────────────────────────────────────────────────
+        return { tickSize: '0.01', negRisk: false, conditionId: '', question: '', endDateIso: null, active: true, acceptingOrders: true };
     });
-}
-
-/** Execute a merged batch of buys for the same market. */
-async function _executeBatchedBuys(effectiveConditionId, entries) {
-    if (entries.length === 0) return;
-
-    // Use marketOpts from the first entry (all same market)
-    const marketOpts = entries[0].marketOpts;
-    // Merge trades: sum the USDC sizes the trader deployed across all signals
-    const mergedTrade = {
-        ...entries[0].trade,
-        size: entries.reduce((sum, e) => sum + (e.trade.size || 0), 0),
-    };
-
-    if (entries.length > 1) {
-        logger.info(`Batching ${entries.length} concurrent BUY signals for ${mergedTrade.market || effectiveConditionId}`);
-    }
-
-    await _doExecuteBuy(mergedTrade, marketOpts, effectiveConditionId);
 }
 
 /**
  * Execute a BUY trade (copy trader's buy).
- * Uses a 500ms batching window — concurrent signals for the same market
- * are merged into one combined order instead of serialized behind each other.
+ *
+ * Uses an in-flight lock to prevent concurrent buys for the same market.
+ * If a buy is already executing for this conditionId, the signal is skipped
+ * (the in-flight order naturally covers both). The lock auto-clears after
+ * 30s to prevent stuck locks from hung executions.
  */
-export function executeBuy(trade) {
+export async function executeBuy(trade) {
     const { tokenId, conditionId } = trade;
 
-    // Resolve conditionId to use as batch key.
-    return getMarketOptions(tokenId).then((marketOpts) => {
-        const effectiveConditionId = conditionId || marketOpts.conditionId;
+    // Get market options (instant — returns defaults on cache miss, warms cache in background)
+    const marketOpts = await getMarketOptions(tokenId);
+    const effectiveConditionId = conditionId || marketOpts.conditionId;
 
-        // If a batch window is already open for this market, merge into it
-        const existing = _batchWindows.get(effectiveConditionId);
-        if (existing) {
-            clearTimeout(existing.timer);
-            existing.entries.push({ trade, marketOpts });
-            // Reset the window — wait another BATCH_WINDOW_MS from latest signal
-            existing.timer = setTimeout(() => {
-                _batchWindows.delete(effectiveConditionId);
-                _executeBatchedBuys(effectiveConditionId, existing.entries).then(existing.resolve);
-            }, BATCH_WINDOW_MS);
-            return existing.promise;
+    if (!effectiveConditionId) {
+        logger.warn(`Cannot execute buy — no conditionId for ${trade.market || tokenId}`);
+        return;
+    }
+
+    // ── In-flight lock: skip if already processing this market ──────────────
+    if (_inFlightBuys.has(effectiveConditionId)) {
+        logger.info(`Buy already in-flight for ${effectiveConditionId.slice(-8)} — skipping duplicate signal`);
+        return;
+    }
+
+    // Acquire lock with auto-clear timeout
+    const lockTimer = setTimeout(() => {
+        logger.warn(`In-flight lock for ${effectiveConditionId.slice(-8)} timed out after ${IN_FLIGHT_LOCK_TIMEOUT_MS / 1000}s — force-clearing`);
+        _inFlightBuys.delete(effectiveConditionId);
+    }, IN_FLIGHT_LOCK_TIMEOUT_MS);
+    _inFlightBuys.set(effectiveConditionId, lockTimer);
+
+    try {
+        await _doExecuteBuy(trade, marketOpts, effectiveConditionId);
+    } finally {
+        clearTimeout(lockTimer);
+        _inFlightBuys.delete(effectiveConditionId);
+    }
+}
+
+/**
+ * Round a price to the nearest valid tick increment.
+ * For BUY orders (roundUp=true): rounds UP so our bid competes better.
+ */
+function _roundPriceToTick(price, tickSizeStr, roundUp = true) {
+    const tick = parseFloat(tickSizeStr) || 0.01;
+    const decimals = Math.max((String(tickSizeStr).split('.')[1] || '').length, 2);
+    const rounded = roundUp
+        ? Math.ceil(price / tick) * tick
+        : Math.floor(price / tick) * tick;
+    return parseFloat(rounded.toFixed(decimals));
+}
+
+/**
+ * Exact-copy mode: our scaled-down trade size is below the CLOB $1 minimum,
+ * so we place a GTC limit order matching the trader's actual shares at their
+ * price. GTC limit orders don't have the $1 market-order minimum.
+ *
+ * Polls for fill every 1s with a 30s timeout, then updates the position.
+ */
+async function _handleBelowMinimumBuy(ctx) {
+    const { tokenId, market, price, size, traderUsdc, tradeSize, effectiveMin,
+            marketOpts, effectiveConditionId, existingPos, trade } = ctx;
+
+    // Round shares down to integer — limit orders must use whole shares
+    const copyShares = Math.floor(size);
+    const copyUsdc = copyShares * (price || 0);
+
+    if (copyUsdc <= 0 || copyShares <= 0) {
+        logger.warn(`Trade size $${tradeSize.toFixed(2)} below $${effectiveMin} minimum — trader order also empty, skipping`);
+        return;
+    }
+
+    // Cap against position limit
+    if (existingPos) {
+        const remaining = config.maxPositionSize - (existingPos.totalCost || 0);
+        if (copyUsdc > remaining) {
+            logger.warn(`Exact-copy $${copyUsdc.toFixed(2)} exceeds remaining cap $${remaining.toFixed(2)} — skipping`);
+            return;
         }
+    } else if (copyUsdc > config.maxPositionSize) {
+        logger.warn(`Exact-copy $${copyUsdc.toFixed(2)} exceeds max position $${config.maxPositionSize} — skipping`);
+        return;
+    }
 
-        // Start a new batch window
-        let resolveBatch;
-        const promise = new Promise((r) => { resolveBatch = r; });
-        const batch = {
-            entries: [{ trade, marketOpts }],
-            timer: setTimeout(() => {
-                _batchWindows.delete(effectiveConditionId);
-                _executeBatchedBuys(effectiveConditionId, batch.entries).then(resolveBatch);
-            }, BATCH_WINDOW_MS),
-            resolve: resolveBatch,
-            promise,
-        };
-        _batchWindows.set(effectiveConditionId, batch);
-        return promise;
-    });
+    logger.info(`Exact-copy: our calc $${tradeSize.toFixed(2)} < $${effectiveMin} min → GTC limit ${copyShares.toFixed(4)} shares @ $${(price || 0).toFixed(4)} ($${copyUsdc.toFixed(2)})`);
+
+    if (config.dryRun) {
+        logger.trade(`[SIM] Exact-copy BUY ${market || tokenId} | ${copyShares.toFixed(4)} sh @ $${(price || 0).toFixed(4)} | outcome: ${trade.outcome || '?'}`);
+        if (existingPos) {
+            const newShares = existingPos.shares + copyShares;
+            const newTotalCost = existingPos.totalCost + copyUsdc;
+            updatePosition(effectiveConditionId, { shares: newShares, avgBuyPrice: newTotalCost / newShares, totalCost: newTotalCost });
+            logger.info(`[SIM] Exact-copy accumulated: $${newTotalCost.toFixed(2)} / $${config.maxPositionSize}`);
+        } else {
+            addPosition({ conditionId: effectiveConditionId, tokenId, market: market || marketOpts.question || tokenId, shares: copyShares, avgBuyPrice: price, totalCost: copyUsdc, outcome: trade.outcome });
+        }
+        recordSimBuy();
+        return;
+    }
+
+    // Place GTC limit at trader's price + 1% premium (capped at 0.99), rounded to valid tick
+    const client = getClient();
+    const rawCopyPrice = Math.min((price || 0) * 1.01, 0.99);
+    const gtcPrice = _roundPriceToTick(rawCopyPrice, marketOpts.tickSize, true);
+    const gtcShares = parseFloat(copyShares.toFixed(4));
+
+    try {
+        const resp = await client.createAndPostOrder(
+            { tokenID: tokenId, side: Side.BUY, price: gtcPrice, size: gtcShares },
+            { tickSize: marketOpts.tickSize, negRisk: marketOpts.negRisk },
+            OrderType.GTC,
+        );
+        if (!resp?.success) {
+            logger.warn(`Exact-copy GTC rejected: ${resp?.errorMsg || 'unknown'}`);
+            return;
+        }
+        logger.info(`Exact-copy GTC placed: ${resp.orderID?.slice(-8)} | ${gtcShares.toFixed(4)} sh @ $${gtcPrice.toFixed(4)}`);
+
+        // Poll every 1s for fill (30s timeout)
+        const deadline = Date.now() + 30_000;
+        while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 1000));
+            try {
+                const order = await client.getOrder(resp.orderID);
+                const matched = parseFloat(order?.size_matched ?? order?.matched_amount ?? '0');
+                const status = (order?.status ?? order?.order_status ?? '').toLowerCase();
+                if (matched > 0 || status === 'matched' || status === 'filled') {
+                    const filledSh = matched > 0 ? matched : gtcShares;
+                    const filledCost = filledSh * gtcPrice;
+                    logger.success(`Exact-copy filled: ${filledSh.toFixed(4)} shares @ ~$${gtcPrice.toFixed(4)}`);
+
+                    if (existingPos) {
+                        const newShares = existingPos.shares + filledSh;
+                        const newTotalCost = existingPos.totalCost + filledCost;
+                        updatePosition(effectiveConditionId, { shares: newShares, avgBuyPrice: newTotalCost / newShares, totalCost: newTotalCost });
+                        logger.success(`Position updated: ${existingPos.market} | total $${newTotalCost.toFixed(2)} / $${config.maxPositionSize}`);
+                    } else {
+                        addPosition({ conditionId: effectiveConditionId, tokenId, market: market || marketOpts.question || tokenId, shares: filledSh, avgBuyPrice: gtcPrice, totalCost: filledCost, outcome: trade.outcome });
+                        try { await ensureExchangeApproval(marketOpts.negRisk); } catch (_) { /* non-critical */ }
+                        if (config.autoSellEnabled) {
+                            await placeAutoSell(effectiveConditionId, tokenId, filledSh, gtcPrice, marketOpts);
+                        }
+                    }
+                    return;
+                }
+                if (status === 'cancelled') { logger.warn('Exact-copy GTC cancelled before fill'); return; }
+            } catch (_) { /* getOrder can 404 briefly */ }
+        }
+        try { await client.cancelOrder({ orderID: resp.orderID }); } catch (_) { /* ignore */ }
+        logger.warn('Exact-copy GTC did not fill within 30s');
+    } catch (err) {
+        logger.error(`Exact-copy GTC failed: ${err.message}`);
+    }
 }
 
 /**
@@ -187,7 +334,13 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
     // Calculate our trade size: SIZE_PERCENT% of the trader's USDC spend
     // trade.size is in SHARES — convert to USDC: shares × price
     const traderUsdc = (size || 0) * (price || 0);
-    let tradeSize = await calculateTradeSize(traderUsdc);
+
+    // Parallelize: trade size calculation and balance check are independent
+    const [tradeSizeRaw, balance] = await Promise.all([
+        calculateTradeSize(traderUsdc),
+        _getCachedBalance(),
+    ]);
+    let tradeSize = tradeSizeRaw;
 
     // Cap so we don't exceed maxPositionSize
     if (existingPos) {
@@ -197,16 +350,22 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
         tradeSize = Math.min(tradeSize, config.maxPositionSize);
     }
 
-    // Polymarket enforces a hard $1 minimum per market order.
+    // Polymarket enforces a hard $1 minimum per FAK market order.
+    // When our scaled-down order would be below this minimum, switch to
+    // "exact-copy" mode: place a GTC limit order matching the trader's
+    // actual shares and price. GTC limit orders have no $1 minimum.
     const CLOB_MIN_ORDER_USDC = 1;
     const effectiveMin = Math.max(config.minTradeSize, CLOB_MIN_ORDER_USDC);
+
     if (tradeSize < effectiveMin) {
-        logger.warn(`Trade size $${tradeSize.toFixed(2)} below $${effectiveMin} minimum — skipping buy`);
+        await _handleBelowMinimumBuy({
+            tokenId, market, price, size, traderUsdc, tradeSize, effectiveMin,
+            marketOpts, effectiveConditionId, existingPos, trade,
+        });
         return;
     }
 
-    // Check balance (cached within 2s window)
-    const balance = await _getCachedBalance();
+    // Balance was already fetched in parallel above — check it now
     if (balance < tradeSize) {
         logger.error(`Insufficient balance: $${balance.toFixed(2)} < $${tradeSize.toFixed(2)} needed`);
         return;
@@ -256,7 +415,8 @@ async function _doExecuteBuy(trade, marketOpts, effectiveConditionId) {
 
     // ── GTC background task ───────────────────────────────────────────────
     const _runGtcBackground = async () => {
-        const gtcPrice = parseFloat(Math.min(price * 1.02, 0.99).toFixed(4));
+        const rawGtc = Math.min(price * 1.02, 0.99);
+        const gtcPrice = _roundPriceToTick(rawGtc, marketOpts.tickSize, true);
         const shares = parseFloat((tradeSize / gtcPrice).toFixed(4));
 
         try {
