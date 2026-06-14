@@ -217,8 +217,9 @@ async function _handleBelowMinimumBuy(ctx) {
     const { tokenId, market, price, size, traderUsdc, tradeSize, effectiveMin,
             marketOpts, effectiveConditionId, existingPos, trade } = ctx;
 
-    // Round shares down to integer — limit orders must use whole shares
-    const copyShares = Math.floor(size);
+    // Scale to our SIZE_PERCENT, then floor. Minimum 1 share if trader bought at least 1.
+    const scaledShares = Math.floor(size * (config.sizePercent / 100));
+    const copyShares = scaledShares >= 1 ? scaledShares : (size >= 1 ? 1 : 0);
     const copyUsdc = copyShares * (price || 0);
 
     if (copyUsdc <= 0 || copyShares <= 0) {

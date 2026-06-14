@@ -75,22 +75,37 @@ async function printStatus() {
                 const mp = await client.getMidpoint(pos.tokenId);
                 const mid = parseFloat(mp?.mid ?? mp ?? '0');
                 if (mid > 0) {
-                    const pnl  = (mid - pos.avgBuyPrice) * pos.shares;
-                    const sign = pnl >= 0 ? '+' : '';
-                    const pct  = pos.totalCost > 0 ? ((pnl / pos.totalCost) * 100).toFixed(1) : '0.0';
-                    pnlStr = ` | unrealized ${sign}$${pnl.toFixed(2)} (${sign}${pct}%)`;
+                    const pnl    = (mid - pos.avgBuyPrice) * pos.shares;
+                    const profit = pnl >= 0;
+                    const color  = profit ? '\x1b[32m' : '\x1b[31m';
+                    const sign   = profit ? '+' : '-';
+                    const pctVal = pos.totalCost > 0 ? Math.abs((pnl / pos.totalCost) * 100) : 0;
+                    const pnlAmt = `${sign}$${Math.abs(pnl).toFixed(2)}`;
+                    pnlStr = ` | ${color}${pnlAmt.padStart(8)} (${sign}${pctVal.toFixed(1).padStart(5)}%)\x1b[0m`;
                 }
             } catch { /* price unavailable */ }
 
             const parsed = parseWeatherTitle(pos.market || '');
-            const name = parsed
-                ? `${parsed.city} | ${parsed.date} | ${parsed.tempRange}`
-                : (pos.market || pos.tokenId || '');
-            logger.info(
-                `  [${pos.outcome || '?'}] ${name}` +
-                ` | ${pos.shares.toFixed(4)} sh @ $${pos.avgBuyPrice.toFixed(4)}` +
-                ` | spent $${(pos.totalCost || 0).toFixed(2)}${pnlStr}`,
-            );
+            if (parsed) {
+                const outcome = `[${pos.outcome || '?'}]`.padEnd(5);
+                const city    = parsed.city.padEnd(20);
+                const date    = parsed.date.padEnd(10);
+                const temp    = parsed.tempRange.padEnd(8);
+                const shares  = pos.shares.toFixed(4).padStart(10);
+                const price   = `$${pos.avgBuyPrice.toFixed(4)}`.padStart(9);
+                const spent   = `$${(pos.totalCost || 0).toFixed(2)}`.padStart(8);
+                logger.info(
+                    `  ${outcome} ${city} ${date} ${temp} ${shares} sh @ ${price}  spent ${spent}${pnlStr}`,
+                );
+            } else {
+                const name = (pos.market || pos.tokenId || '').substring(0, 40);
+                const shares = pos.shares.toFixed(4).padStart(10);
+                const price  = `$${pos.avgBuyPrice.toFixed(4)}`.padStart(9);
+                const spent  = `$${(pos.totalCost || 0).toFixed(2)}`.padStart(8);
+                logger.info(
+                    `  ${name.padEnd(40)} ${shares} sh @ ${price}  spent ${spent}${pnlStr}`,
+                );
+            }
         }
 
         if (config.dryRun) {
@@ -200,7 +215,7 @@ async function main() {
     const redeemerInterval = setInterval(redeemerLoop, config.redeemInterval);
 
     // Print status every 60 seconds
-    const statusInterval = setInterval(printStatus, 60_000);
+    const statusInterval = setInterval(printStatus, 300_000);
 
     const shutdown = () => {
         logger.info('Shutting down...');
